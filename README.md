@@ -1,85 +1,87 @@
-# Uniswap v4 Hook Template
+# ForexSwap
 
-**A template for writing Uniswap v4 Hooks 🦄**
+> ⚠️ **WARNING:** This code has not yet been audited. Use at your own risk.
 
-### Get Started
+## Overview
 
-This template provides a starting point for writing Uniswap v4 Hooks, including a simple example and preconfigured test environment. Start by creating a new repository using the "Use this template" button at the top right of this page. Alternatively you can also click this link:
+ForexSwap is a Uniswap v4 hook implementation of a [log normal](https://en.wikipedia.org/wiki/Log-normal_distribution) market maker. It's statistical curve makes liquidity provisioning more passive and capital efficient on frontier currency pairs such as USD/KES that experience periods of high volatilty.
 
-[![Use this Template](https://img.shields.io/badge/Use%20this%20Template-101010?style=for-the-badge&logo=github)](https://github.com/uniswapfoundation/v4-template/generate)
+## Quick Start
 
-1. The example hook [Counter.sol](src/Counter.sol) demonstrates the `beforeSwap()` and `afterSwap()` hooks
-2. The test template [Counter.t.sol](test/Counter.t.sol) preconfigures the v4 pool manager, test tokens, and test liquidity.
+Clone and set up the project:
 
-<details>
-<summary>Updating to v4-template:latest</summary>
-
-This template is actively maintained -- you can update the v4 dependencies, scripts, and helpers:
-
-```bash
-git remote add template https://github.com/uniswapfoundation/v4-template
-git fetch template
-git merge template/main <BRANCH> --allow-unrelated-histories
+```sh
+$ git clone https://github.com/robertleifke/forex-swap
+$ cd forex-swap
+$ bun install
+$ forge build
 ```
 
-</details>
+## Deploy pools
 
-### Requirements
+```solidity
+IPoolManager poolManager = 
+ForexSwap forexSwapHook = new ForexSwap(poolManager);
 
-This template is designed to work with Foundry (stable). If you are using Foundry Nightly, you may encounter compatibility issues. You can update your Foundry installation to the latest stable version by running:
+PoolKey memory poolKey = PoolKey({
+    currency0: Currency.wrap(address(token0)),
+    currency1: Currency.wrap(address(token1)),
+    fee: 0,
+    tickSpacing: 0,
+    hooks: IHooks(address(forexSwapHook))
+});
+forexSwapHook.initializePool(poolKey);
 
-```
-foundryup
-```
-
-To set up the project, run the following commands in your terminal to install dependencies and run the tests:
-
-```
-forge install
-forge test
-```
-
-### Local Development
-
-Other than writing unit tests (recommended!), you can only deploy & test hooks on [anvil](https://book.getfoundry.sh/anvil/) locally. Scripts are available in the `script/` directory, which can be used to deploy hooks, create pools, provide liquidity and swap tokens. The scripts support both local `anvil` environment as well as running them directly on a production network.
-
-### Troubleshooting
-
-<details>
-
-#### Permission Denied
-
-When installing dependencies with `forge install`, Github may throw a `Permission Denied` error
-
-Typically caused by missing Github SSH keys, and can be resolved by following the steps [here](https://docs.github.com/en/github/authenticating-to-github/connecting-to-github-with-ssh)
-
-Or [adding the keys to your ssh-agent](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent#adding-your-ssh-key-to-the-ssh-agent), if you have already uploaded SSH keys
-
-#### Anvil fork test failures
-
-Some versions of Foundry may limit contract code size to ~25kb, which could prevent local tests to fail. You can resolve this by setting the `code-size-limit` flag
-
-```
-anvil --code-size-limit 40000
+forexSwapHook.updateForexSwapParams(
+    1.1e18,  // mu = 1.1 (10% mean premium)
+    2.5e17,  // sigma = 0.25 (25% volatility)
+    5e15     // swapFee = 0.5%
+);
 ```
 
-#### Hook deployment failures
+## Testing
 
-Hook deployment failures are caused by incorrect flags or incorrect salt mining
+Run comprehensive tests for the ForexSwap implementation:
 
-1. Verify the flags are in agreement:
-   - `getHookCalls()` returns the correct flags
-   - `flags` provided to `HookMiner.find(...)`
-2. Verify salt mining is correct:
-   - In **forge test**: the _deployer_ for: `new Hook{salt: salt}(...)` and `HookMiner.find(deployer, ...)` are the same. This will be `address(this)`. If using `vm.prank`, the deployer will be the pranking address
-   - In **forge script**: the deployer must be the CREATE2 Proxy: `0x4e59b44847b379578588920cA78FbF26c0B4956C`
-     - If anvil does not have the CREATE2 deployer, your foundry may be out of date. You can update it with `foundryup`
+```sh
+# Run all tests
+$ forge test
 
-</details>
+# Run with detailed output
+$ forge test -vvv
 
-### Additional Resources
+# Run gas reporting
+$ forge test --gas-report
 
-- [Uniswap v4 docs](https://docs.uniswap.org/contracts/v4/overview)
-- [v4-periphery](https://github.com/uniswap/v4-periphery)
-- [v4-core](https://github.com/uniswap/v4-core)
-- [v4-by-example](https://v4-by-example.org)
+# Run specific ForexSwap tests
+$ forge test --match-contract ForexSwap -vv
+```
+
+
+## Routing
+
+### Inverse Normal CDF Implementation
+
+ForexSwap uses the Beasley-Springer-Moro algorithm for computing Φ⁻¹(u):
+
+```solidity
+function _improvedInverseNormalCDF(uint256 u) internal pure returns (int256) {
+    // Bounded to [-6σ, +6σ] for numerical stability
+}
+```
+
+### Newton-Raphson Iteration
+
+For swap calculations, ForexSwap employs iterative solving:
+
+```solidity
+function _solveExactInputWithLiquidity(...) internal view returns (...) {
+    // Initial guess using constant product
+    // Newton-Raphson iteration to solve: Φ⁻¹(x'/L) + Φ⁻¹(y'/L) = k
+    // Convergence threshold: 1e-6 in WAD precision
+    // Maximum iterations: 50
+}
+```
+## License
+
+This project is licensed under a Business Source License - see the [LICENSE](LICENSE) file for details.
