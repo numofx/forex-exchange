@@ -185,6 +185,9 @@ contract Counter is BaseHook {
         // This signals to dynamic-fee pools to use this fee instead of the stored fee
         if (fee > 0) {
             fee = fee | LPFeeLibrary.OVERRIDE_FEE_FLAG;
+        } else {
+            // Return 0 to signal "no override" when fee not set
+            fee = 0;
         }
 
         return (BaseHook.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, fee);

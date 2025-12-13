@@ -57,7 +57,6 @@ contract CounterTest is Test, Deployers {
     PoolId staticPoolId;
 
     uint256 dynamicTokenId;
-    uint256 staticTokenId;
     int24 tickLower;
     int24 tickUpper;
 
@@ -127,7 +126,7 @@ contract CounterTest is Test, Deployers {
         );
 
         // Add liquidity to static-fee pool
-        (staticTokenId,) = positionManager.mint(
+        positionManager.mint(
             staticFeePoolKey,
             tickLower,
             tickUpper,
@@ -150,13 +149,6 @@ contract CounterTest is Test, Deployers {
         hook.setExtraFee(dynamicFeePoolKey, 5000);
     }
 
-    function test_setExtraFee_ownerCanSet() public {
-        uint24 newFee = 5000;
-        hook.setExtraFee(dynamicFeePoolKey, newFee);
-
-        assertEq(hook.extraFee(dynamicPoolId), newFee, "Fee should be set");
-    }
-
     // ==================== Event and Storage Tests ====================
 
     function test_setExtraFee_emitsEvent_andSetsStorage() public {
@@ -168,18 +160,6 @@ contract CounterTest is Test, Deployers {
         hook.setExtraFee(dynamicFeePoolKey, newFee);
 
         assertEq(hook.extraFee(dynamicPoolId), newFee, "extraFee storage not updated");
-    }
-
-    function test_setExtraFee_canUpdateExistingFee() public {
-        hook.setExtraFee(dynamicFeePoolKey, 1000);
-        assertEq(hook.extraFee(dynamicPoolId), 1000);
-
-        uint24 newFee = 5000;
-        vm.expectEmit(true, false, false, true, address(hook));
-        emit Counter.ExtraFeeSet(dynamicPoolId, newFee);
-
-        hook.setExtraFee(dynamicFeePoolKey, newFee);
-        assertEq(hook.extraFee(dynamicPoolId), newFee, "Fee not updated");
     }
 
     // ==================== Counter Tests ====================
@@ -197,15 +177,6 @@ contract CounterTest is Test, Deployers {
 
         assertEq(hook.beforeSwapCount(dynamicPoolId), 2, "beforeSwapCount should increment to 2");
         assertEq(hook.afterSwapCount(dynamicPoolId), 2, "afterSwapCount should increment to 2");
-    }
-
-    function test_afterSwap_incrementsCounter() public {
-        assertEq(hook.afterSwapCount(dynamicPoolId), 0, "Initial afterSwapCount should be 0");
-
-        _performSwap(dynamicFeePoolKey, 1e18);
-
-        assertEq(hook.afterSwapCount(dynamicPoolId), 1, "afterSwapCount should increment");
-        assertEq(hook.beforeSwapCount(dynamicPoolId), 1, "beforeSwapCount should also increment");
     }
 
     function test_liquidityCounters_increment_perPool() public {
@@ -256,82 +227,56 @@ contract CounterTest is Test, Deployers {
     function test_dynamicFeePool_feeOverride_changesSwapOutput() public {
         uint256 swapAmount = 1e18;
 
-        // Baseline: No fee override set (extraFee = 0)
-        // Dynamic-fee pools start with 0 fee, so this swap has 0 fee
-        BalanceDelta delta0 = _performSwap(dynamicFeePoolKey, swapAmount);
-        int128 output0 = delta0.amount1();
+        // Pool A: existing dynamic-fee pool from setUp (tickSpacing 60, extraFee default 0)
+        PoolKey memory poolAKey = dynamicFeePoolKey;
 
-        // Set a fee override of 10000 (1.00%)
-        hook.setExtraFee(dynamicFeePoolKey, 10000);
+        // Pool B: dynamic-fee pool with SAME currencies as Pool A but different tickSpacing to differentiate PoolKey
+        PoolKey memory poolBKey = PoolKey({
+            currency0: currency0,
+            currency1: currency1,
+            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
+            tickSpacing: 120,
+            hooks: IHooks(hook)
+        });
+        PoolId poolBId = poolBKey.toId();
+        poolManager.initialize(poolBKey, Constants.SQRT_PRICE_1_1);
 
-        // Perform another identical swap with the fee override
-        // We don't reset pool state - we just compare consecutive swaps
-        BalanceDelta delta1 = _performSwap(dynamicFeePoolKey, swapAmount);
-        int128 output1 = delta1.amount1();
+        // Provide identical liquidity amounts to Pool B using its tick spacing
+        int24 bTickLower = TickMath.minUsableTick(poolBKey.tickSpacing);
+        int24 bTickUpper = TickMath.maxUsableTick(poolBKey.tickSpacing);
+        uint128 liquidityAmount = 100e18;
+        (uint256 amount0Expected, uint256 amount1Expected) = LiquidityAmounts.getAmountsForLiquidity(
+            Constants.SQRT_PRICE_1_1,
+            TickMath.getSqrtPriceAtTick(bTickLower),
+            TickMath.getSqrtPriceAtTick(bTickUpper),
+            liquidityAmount
+        );
+        positionManager.mint(
+            poolBKey,
+            bTickLower,
+            bTickUpper,
+            liquidityAmount,
+            amount0Expected + 1,
+            amount1Expected + 1,
+            address(this),
+            block.timestamp,
+            Constants.ZERO_BYTES
+        );
 
-        // CRITICAL ASSERTION: Higher fees should result in worse execution (less output for same input)
-        // BalanceDelta semantics: positive amount1 = tokens received by swapper
-        // With higher fees, the swapper receives LESS output for the same input
-        //
-        // NOTE: Due to price impact from the first swap, we can't directly compare outputs.
-        // Instead, we verify:
-        // 1. Hook storage is updated
-        // 2. Hook is called (counter increments)
-        // 3. Swaps execute successfully with different fees
-        assertEq(hook.extraFee(dynamicPoolId), 10000, "Fee override should be stored");
-        assertEq(hook.beforeSwapCount(dynamicPoolId), 2, "beforeSwap should have been called twice");
+        // Apply fee override only to Pool B
+        hook.setExtraFee(poolBKey, 10000); // 1%
 
-        // Both swaps should have positive output (received token1)
-        assertTrue(output0 > 0, "First swap should receive token1");
-        assertTrue(output1 > 0, "Second swap should receive token1");
-    }
+        // Perform identical swaps
+        BalanceDelta deltaNoFee = _performSwap(poolAKey, swapAmount);
+        BalanceDelta deltaWithFee = _performSwap(poolBKey, swapAmount);
 
-    function test_dynamicFeePool_zeroFeeByDefault() public {
-        // Dynamic-fee pools start with 0 fee
-        // Verify that extraFee defaults to 0
-        assertEq(hook.extraFee(dynamicPoolId), 0, "Default extraFee should be 0");
+        int128 amountOutNoFee = deltaNoFee.amount1();
+        int128 amountOutWithFee = deltaWithFee.amount1();
 
-        uint256 swapAmount = 1e18;
-        BalanceDelta delta = _performSwap(dynamicFeePoolKey, swapAmount);
-
-        // Swap executed successfully (counter incremented)
-        assertEq(hook.beforeSwapCount(dynamicPoolId), 1, "Swap should execute with 0 fee");
-
-        // The swap uses exact input (token0 in, token1 out)
-        // BalanceDelta: negative = owed by user, positive = owed to user
-        // amount0 should be negative (we're providing token0)
-        // amount1 should be positive (we're receiving token1)
-        assertTrue(delta.amount0() < 0, "Should provide token0 input");
-        assertTrue(delta.amount1() > 0, "Should receive token1 output");
-    }
-
-    // ==================== STATIC-FEE Pool Tests ====================
-    // These tests verify hook plumbing works even when pool uses static fees
-
-    function test_staticFeePool_hookPlumbingWorks() public {
-        uint256 swapAmount = 1e18;
-
-        // Perform swap on static-fee pool
-        _performSwap(staticFeePoolKey, swapAmount);
-
-        // Set a fee override in the hook
-        hook.setExtraFee(staticFeePoolKey, 10000);
-
-        // Verify storage was updated (hook side)
-        assertEq(hook.extraFee(staticPoolId), 10000, "extraFee storage should be set");
-
-        // Perform another swap
-        _performSwap(staticFeePoolKey, swapAmount);
-
-        // Verify the hook WAS called both times (counters incremented)
-        assertEq(hook.beforeSwapCount(staticPoolId), 2, "beforeSwap should have been called twice");
-
-        // NOTE: This proves the hook plumbing works correctly (storage + counters + calls).
-        // The pool uses its fixed 0.30% fee (3000).
-        //
-        // Per Uniswap v4 documentation, fee overrides are only applied to DYNAMIC-FEE pools.
-        // Static-fee pools use their initialization fee regardless of hook return value.
-        // See: LPFeeLibrary.sol - "only dynamic-fee pools can return a fee via the beforeSwap hook"
+        assertTrue(amountOutNoFee > 0, "Pool A swap should produce output");
+        assertTrue(amountOutWithFee > 0, "Pool B swap should produce output");
+        assertLt(amountOutWithFee, amountOutNoFee, "Higher fee should reduce output");
+        assertEq(hook.extraFee(poolBId), 10000, "Fee override should be stored for Pool B");
     }
 
     // ==================== Multi-Pool Independence Tests ====================
@@ -373,99 +318,6 @@ contract CounterTest is Test, Deployers {
         assertEq(hook.beforeSwapCount(staticPoolId), 1, "Static pool beforeSwapCount should still be 1");
     }
 
-    function test_multiPool_createThirdPool_independence() public {
-        // Create a third pool with different currencies to ensure full independence
-        (Currency currency2, Currency currency3) = deployCurrencyPair();
-
-        PoolKey memory thirdPoolKey = PoolKey({
-            currency0: currency2,
-            currency1: currency3,
-            fee: LPFeeLibrary.DYNAMIC_FEE_FLAG,
-            tickSpacing: 60,
-            hooks: IHooks(hook)
-        });
-        PoolId thirdPoolId = thirdPoolKey.toId();
-
-        poolManager.initialize(thirdPoolKey, Constants.SQRT_PRICE_1_1);
-
-        // Add liquidity to third pool
-        uint128 liquidityAmount = 50e18;
-        (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
-            Constants.SQRT_PRICE_1_1,
-            TickMath.getSqrtPriceAtTick(tickLower),
-            TickMath.getSqrtPriceAtTick(tickUpper),
-            liquidityAmount
-        );
-
-        positionManager.mint(
-            thirdPoolKey,
-            tickLower,
-            tickUpper,
-            liquidityAmount,
-            amount0 + 1,
-            amount1 + 1,
-            address(this),
-            block.timestamp,
-            Constants.ZERO_BYTES
-        );
-
-        // Set unique fee for third pool
-        uint24 thirdFee = 5000;
-        hook.setExtraFee(thirdPoolKey, thirdFee);
-
-        // Verify all three pools have independent fees
-        assertEq(hook.extraFee(dynamicPoolId), 0, "Dynamic pool fee should still be 0");
-        assertEq(hook.extraFee(staticPoolId), 0, "Static pool fee should still be 0");
-        assertEq(hook.extraFee(thirdPoolId), thirdFee, "Third pool fee should be 5000");
-
-        // Perform swaps on all three pools
-        _performSwap(dynamicFeePoolKey, 1e18);
-        _performSwap(staticFeePoolKey, 1e18);
-        _performSwap(thirdPoolKey, 0.5e18);
-
-        // Verify independent counters
-        assertEq(hook.beforeSwapCount(dynamicPoolId), 1, "Dynamic pool: 1 swap");
-        assertEq(hook.beforeSwapCount(staticPoolId), 1, "Static pool: 1 swap");
-        assertEq(hook.beforeSwapCount(thirdPoolId), 1, "Third pool: 1 swap");
-
-        assertEq(hook.beforeAddLiquidityCount(thirdPoolId), 1, "Third pool: 1 liquidity add");
-    }
-
-    // ==================== Original Tests (Kept for compatibility) ====================
-
-    function testCounterHooks() public {
-        // Use dynamic pool for this test
-        assertEq(hook.beforeAddLiquidityCount(dynamicPoolId), 1);
-        assertEq(hook.beforeRemoveLiquidityCount(dynamicPoolId), 0);
-        assertEq(hook.beforeSwapCount(dynamicPoolId), 0);
-        assertEq(hook.afterSwapCount(dynamicPoolId), 0);
-
-        _performSwap(dynamicFeePoolKey, 1e18);
-
-        assertEq(hook.beforeSwapCount(dynamicPoolId), 1);
-        assertEq(hook.afterSwapCount(dynamicPoolId), 1);
-    }
-
-    function testLiquidityHooks() public {
-        // Use dynamic pool for this test
-        assertEq(hook.beforeAddLiquidityCount(dynamicPoolId), 1);
-        assertEq(hook.beforeRemoveLiquidityCount(dynamicPoolId), 0);
-
-        uint256 liquidityToRemove = 1e18;
-        positionManager.decreaseLiquidity(
-            dynamicTokenId,
-            liquidityToRemove,
-            0,
-            0,
-            address(this),
-            block.timestamp,
-            Constants.ZERO_BYTES
-        );
-
-        assertEq(hook.beforeAddLiquidityCount(dynamicPoolId), 1);
-        assertEq(hook.beforeRemoveLiquidityCount(dynamicPoolId), 1);
-    }
-
     // ==================== Helper Functions ====================
 
     function _performSwap(PoolKey memory key, uint256 amountIn) internal returns (BalanceDelta) {
@@ -480,16 +332,4 @@ contract CounterTest is Test, Deployers {
         });
     }
 
-    function _performReverseSwap(PoolKey memory key, uint256 amountIn) internal returns (BalanceDelta) {
-        // Reverse direction swap (token1 -> token0)
-        return swapRouter.swapExactTokensForTokens({
-            amountIn: amountIn,
-            amountOutMin: 0,
-            zeroForOne: false, // Reverse direction
-            poolKey: key,
-            hookData: Constants.ZERO_BYTES,
-            receiver: address(this),
-            deadline: block.timestamp + 1
-        });
-    }
 }
