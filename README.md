@@ -4,7 +4,9 @@
 
 ## Overview
 
-ForexSwap is a Uniswap v4 hook implementation of a [log normal](https://en.wikipedia.org/wiki/Log-normal_distribution) market maker. It's statistical curve makes liquidity provisioning more passive and capital efficient on frontier currency pairs such as USD/KES that experience periods of high volatilty.
+ForexSwap is an automated market maker for FX that is optimized for cross border payments. 
+
+It uses a peicewise [log normal](https://en.wikipedia.org/wiki/Log-normal_distribution) curve to provide always-on, passive liquidity even when prices moves rapidly. This is in contrast to Uniswap V3, which relies on active management to maintain depth during volatility. Therefore, unreliable for payments. ForexSwap is implemented as a Uniswap V4 [custom curve](https://github.com/OpenZeppelin/uniswap-hooks/blob/master/src/base/BaseCustomCurve.sol) hook to leverage the existing Uniswap routing and settlement infrastructure.
 
 ## Quick Start
 
@@ -19,24 +21,29 @@ $ forge build
 
 ## Deploy pools
 
-```solidity
-IPoolManager poolManager = 
+```Solidity
+IPoolManager poolManager = /* deployed PoolManager */;
 ForexSwap forexSwapHook = new ForexSwap(poolManager);
 
 PoolKey memory poolKey = PoolKey({
     currency0: Currency.wrap(address(token0)),
     currency1: Currency.wrap(address(token1)),
     fee: 0,
-    tickSpacing: 0,
+    tickSpacing: 1, // must be nonzero
     hooks: IHooks(address(forexSwapHook))
 });
+
 forexSwapHook.initializePool(poolKey);
 
-forexSwapHook.updateForexSwapParams(
-    1.1e18,  // mu = 1.1 (10% mean premium)
-    2.5e17,  // sigma = 0.25 (25% volatility)
-    5e15     // swapFee = 0.5%
-);
+// Example: USD/KES ~130
+forexSwapHook.updateForexSwapParams({
+    muWad: 4867534450000000000, // ln(130)
+    sigmaWad: 1e17,             // 10% log-vol
+    swapFeeWad: 5e15,           // 0.5%
+    pMinWad: 80e18,
+    pMaxWad: 200e18,
+    numBins: 512
+});
 ```
 
 ## Testing
@@ -60,28 +67,95 @@ $ forge test --match-contract ForexSwap -vv
 
 ## Routing
 
-### Inverse Normal CDF Implementation
+### Piecewise Log-Normal Curve
 
-ForexSwap uses the Beasley-Springer-Moro algorithm for computing Φ⁻¹(u):
+ForexSwap implements a log-normal liquidity profile using a **precomputed, monotone lookup table** over log-price \( z = \ln p \) within a bounded price range \([p_{\min}, p_{\max}]\).
 
-```solidity
-function _improvedInverseNormalCDF(uint256 u) internal pure returns (int256) {
-    // Bounded to [-6σ, +6σ] for numerical stability
-}
-```
+The log-price domain is discretized into \(N\) uniform bins:
 
-### Newton-Raphson Iteration
+\[
+z_i = z_{\min} + i \cdot \Delta z,
+\qquad
+\Delta z = \frac{z_{\max} - z_{\min}}{N}
+\]
 
-For swap calculations, ForexSwap employs iterative solving:
+For each bin boundary, the cumulative inventory is precomputed:
 
-```solidity
-function _solveExactInputWithLiquidity(...) internal view returns (...) {
-    // Initial guess using constant product
-    // Newton-Raphson iteration to solve: Φ⁻¹(x'/L) + Φ⁻¹(y'/L) = k
-    // Convergence threshold: 1e-6 in WAD precision
-    // Maximum iterations: 50
-}
-```
-## License
+\[
+X_i = L \cdot \Phi\!\left(\frac{z_i - \mu}{\sigma}\right)
+\]
 
-This project is licensed under a Business Source License - see the [LICENSE](LICENSE) file for details.
+where:
+- \( \Phi \) is the standard normal CDF,
+- \( L \) is the total liquidity capacity,
+- \( \mu \) and \( \sigma \) parameterize the log-normal distribution.
+
+Only the table values \(X_i\) (and implicitly \(z_i\)) are stored onchain in fixed-point form.
+
+---
+
+### Swap Computation
+
+All swaps are evaluated using **bounded, deterministic execution** with no iterative root-finding.
+
+For a given current inventory \(x\):
+
+1. **Locate the active bin**  
+   Perform a binary search to find index \(i\) such that:
+   \[
+   X_i \le x < X_{i+1}
+   \]
+
+2. **Interpolate price within the bin**  
+   Compute the interpolation factor:
+   \[
+   \lambda = \frac{x - X_i}{X_{i+1} - X_i}
+   \]
+
+   Recover log-price and price:
+   \[
+   z = z_i + \lambda \cdot \Delta z,
+   \qquad
+   p = e^z
+   \]
+
+3. **Execute the swap**  
+   - Small swaps use the local marginal price.
+   - Larger swaps advance across bins and accumulate cost piecewise using closed-form integration.
+
+This approach guarantees predictable gas usage and avoids numerical instability or non-convergence.
+
+---
+
+### Exact-In and Exact-Out Swaps
+
+- **Exact-in:** given an input amount, inventory is advanced forward across bins until the input is exhausted, accumulating output per bin.
+- **Exact-out:** given a target output amount, the required input is computed by integrating price over inventory between the start and end positions.
+
+Within each bin, pricing is linear in log-price, allowing exact closed-form evaluation.
+
+---
+
+### Tail Policy (Always-On Quotes)
+
+ForexSwap supports continuous quoting through price extremes by defining explicit tail behavior outside the table range:
+
+- **Soft tails:**  
+  Beyond \([p_{\min}, p_{\max}]\), log-price increases with a steepening rule, ensuring quotes are always available but become increasingly punitive.
+
+- **Hard bounds:**  
+  Trades that would push the pool outside the supported range revert.
+
+The tail policy is a deliberate risk-management choice and part of the pool configuration.
+
+---
+
+### Design Rationale
+
+This piecewise log-normal implementation:
+- encodes the liquidity profile directly in the pool,
+- removes the need for active LP range management,
+- guarantees always-on quotes when configured with soft tails,
+- uses deterministic, bounded-gas execution suitable for a Uniswap V4 custom-curve hook.
+
+The only approximation introduced is the discretization of the log-price domain; swap execution within each bin is exact.
